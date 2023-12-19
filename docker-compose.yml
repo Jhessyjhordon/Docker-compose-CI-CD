@@ -1,0 +1,434 @@
+version: '3'
+services:
+  traefik:
+    image: traefik:v2.5
+    restart: always
+    command:
+      - "--log.level=DEBUG" # Permet d'avoir les logs de traefik
+      - "--api.insecure=false" # Activer l'API sans sécurité (à désactiver en production)
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false" # Ne pas exposer les containers par défaut
+      - "--entrypoints.web.address=:80" # Port pour le HTTP 
+      - "--entrypoints.websecure.address=:443" # Port pour le HTTPS
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--entrypoints.metrics.address=:8084"
+      #SSL let's encrypt, HTTPS
+      - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.myresolver.acme.email=furiousducks196@gmail.com" # Remplacez par votre email
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8084:8084" # Pour les métriques de Prometheus
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.dsp-archiwebo22b-ji-rw-ah.fr`)" #On associe un nom de domaine au service en question et traefik s'occupera de re router
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=myresolver"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=security@docker,auth" # Ajout d'un middleware pour activer l'authentification + entête sécurité
+      - "traefik.http.middlewares.auth.basicauth.users=fducks196:$$apr1$$gwHGhwYm$$FDd5rOVKGugz8S7a3Mn9o0" # Ajout de l'authenfication via ID et MDP hashé les $ car docker interprète différement les $
+      #Ajout entêtes de sécurité HSTS
+      - "traefik.http.middlewares.security.headers.stsSeconds=31536000" # 1 an
+      - "traefik.http.middlewares.security.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.security.headers.stsPreload=true"
+      #Ajout referrer policy
+      - "traefik.http.middlewares.security.headers.customResponseHeaders.Referrer-Policy=no-referrer"
+      #Ajout permissions policy
+      - "traefik.http.middlewares.security.headers.customResponseHeaders.Permissions-Policy=geolocation=(), microphone=()"
+      - "traefik.http.middlewares.security.headers.customResponseHeaders.X-Frame-Options=SAMEORIGIN"
+      - "traefik.http.middlewares.security.headers.customResponseHeaders.X-Content-Type-Options=nosniff"
+      #Ajout middleware de redirection HTTP à HTTPS
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      #Création routeur pour la redirection
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Traefik doit accéder au socket Docker
+      - ./letsencrypt:/letsencrypt #Stocker les certificats let's encrypt
+    networks:
+      - my-network
+
+  # Ajout des metrics PROMETHEUS
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    volumes:
+      - /home/debian/prometheus-config.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - my-network
+
+  # Utilisation de grafana pour récupérer les metrics de PROMETHEUS
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    networks:
+      - my-network
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - grafanalogs:/var/log/grafana
+      - grafanaplugins:/var/lib/grafana/plugins
+    environment: # Configuration du service SMTP via gmail pour préparer les alertes par
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=smtp.gmail.com:587
+      - GF_SMTP_USER=${GRAFANA_SMTP_USER}
+      - GF_SMTP_PASSWORD=${GRAFANA_SMTP_PASSWORD}
+      - GF_SMTP_FROM_ADDRESS=${GRAFANA_SMTP_USER}
+      - GF_SMTP_FROM_NAME=Grafana
+      - GF_SMTP_STARTTLS_POLICY=Always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000" 
+      - "traefik.http.routers.grafana.tls.certresolver=myresolver"
+      - "traefik.http.routers.grafana.middlewares=security@docker" # Ajout middleware entête de securité
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    restart: always
+    ports:
+      - "9200:9000" # Portainer sera accessible sur le port 9200 de l'hôte
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Montage du socket Docker
+      - portainer_data:/data # Stockage des données de Portainer
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.dsp-archiwebo22b-ji-rw-ah.fr`)" # Remplacez par votre sous-domaine pour Portainer
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls.certresolver=myresolver"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+      - "traefik.http.routers.portainer.middlewares=security@docker"
+    networks:
+      - my-network
+
+
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    restart: always
+    hostname: gitlab
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://gitlab.dsp-archiwebo22b-ji-rw-ah.fr'
+        nginx['listen_port'] = 80 # 
+        nginx['listen_https'] = false
+        nginx['real_ip_trusted_addresses'] = ['172.18.0.0/16']
+        nginx['real_ip_header'] = 'X-Real-IP'
+        nginx['real_ip_recursive'] = 'on'
+    ports:
+      - 81:80
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gitlab.rule=Host(`gitlab.dsp-archiwebo22b-ji-rw-ah.fr`)"  # Sous-domaine pour GitLab
+      - "traefik.http.services.gitlab.loadbalancer.server.port=80"  # Même si GitLab écoute sur le port 81 du host, à l'intérieur du conteneur, il écoute sur le port 80.
+      - "traefik.http.routers.gitlab.entrypoints=websecure"
+      - "traefik.http.routers.gitlab.tls.certresolver=myresolver"
+      - "traefik.http.routers.gitlab.middlewares=security@docker"
+    volumes:
+      - /home/debian/gitlab/config:/etc/gitlab
+      - /home/debian/gitlab/logs:/var/log/gitlab
+      - /home/debian/gitlab/data:/var/opt/gitlab
+    networks:
+      - my-network
+    # Pour environment 
+    # external_url : Cette ligne indique à GitLab l'URL externe à laquelle il sera accessible. Ici, il est configuré pour utiliser le protocole HTTPS.
+    # nginx['listen_port'] = 80: Ici, on configure Nginx pour écouter sur le port 80 pour le trafic HTTP, ce qui est nécessaire car Traefik gérera le trafic HTTPS et le transmettra à GitLab en tant que trafic HTTP.
+    # nginx['listen_https'] = false: Cela désactive l'écoute du trafic HTTPS directement par Nginx, car vous avez Traefik pour gérer le SSL/TLS et la terminaison HTTPS.
+    # nginx['real_ip_trusted_addresses'] = ['172.18.0.0/16']: Cette ligne sert à configurer Nginx pour qu'il fasse confiance aux en-têtes X-Real-IP provenant d'adresses IP au sein de cette plage. Cela permet à Nginx de connaître la véritable adresse IP de l'utilisateur final, même si la requête passe par Traefik.
+    # nginx['real_ip_header'] = 'X-Real-IP': Cette configuration indique à Nginx quel en-tête utiliser pour déterminer l'adresse IP réelle du client lorsqu'il reçoit des requêtes à travers un proxy (Traefik dans votre cas).
+    # nginx['real_ip_recursive'] = 'on': Lorsque cette option est activée, Nginx examinera récursivement les en-têtes X-Real-IP pour obtenir l'adresse IP du client. Cela est utile si vous avez plusieurs niveaux de proxies.
+  jenkins:
+    image: jenkins/jenkins:2.414.3-lts-jdk17
+    restart: always
+    hostname: jenkins
+    #ports:
+    #  - 8080:8081
+    #  - 50000:50000
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jenkins.rule=Host(`jenkins.dsp-archiwebo22b-ji-rw-ah.fr`)"
+      - "traefik.http.services.jenkins.loadbalancer.server.port=8080"
+      - "traefik.http.routers.jenkins.entrypoints=websecure"
+      - "traefik.http.routers.jenkins.tls.certresolver=myresolver"
+      - "traefik.http.routers.jenkins.middlewares=security@docker" # Ajout middleware entête de securité
+    volumes:
+      - /home/debian/jenkins_home:/debian/jenkins_home
+      - /home/debian/docker-compose.yml:/home/debian/docker-compose.yml
+      - /home/debian/.env:/home/debian/.env
+      - /home/debian/api/Dockerfile:/home/debian/api/Dockerfile
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker
+      - /usr/local/bin/docker-compose:/usr/local/bin/docker-compose
+    networks:
+      - my-network
+
+  # Service Site web pour le déploiement
+  angular-unknown:
+    container_name: angular-unknown
+    build:
+      context: ${WORKSPACE_PATH}/angular
+      dockerfile: Dockerfile.dev
+    ports:
+      - 85:80  # Assurez-vous que le Dockerfile configure votre application Angular pour servir sur le port 80, sinon ajustez-le
+    labels:
+     - "traefik.enable=true"
+     - "traefik.http.routers.angular-unknown.rule=Host(`unknown.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+     - "traefik.http.routers.angular-unknown.entrypoints=websecure"
+     - "traefik.http.services.angular-unknown.loadbalancer.server.port=80" 
+     - "traefik.http.routers.angular-unknown.tls.certresolver=myresolver"
+    networks:
+     - my-network
+
+  angular-dev:
+    container_name: angular-dev
+    build:
+      context: ${WORKSPACE_PATH}/angular
+      dockerfile: Dockerfile.dev
+    ports:
+      - 82:80  # Assurez-vous que le Dockerfile configure votre application Angular pour servir sur le port 80, sinon ajustez-le
+    labels:
+     - "traefik.enable=true"
+     - "traefik.http.routers.angular-dev.rule=Host(`dev.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+     - "traefik.http.routers.angular-dev.entrypoints=websecure"
+     - "traefik.http.services.angular-dev.loadbalancer.server.port=80" 
+     - "traefik.http.routers.angular-dev.tls.certresolver=myresolver"
+    networks:
+     - my-network
+
+  angular-preprod:
+    container_name: angular-preprod
+    build:
+      context: ${WORKSPACE_PATH}/preprod-angular
+      dockerfile: Dockerfile.preprod
+    ports:
+      - 83:80  # Mappé sur le port 80 car il y a nginx dans le container préprod
+    labels:
+     - "traefik.enable=true"
+     - "traefik.http.routers.angular-preprod.rule=Host(`preprod.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+     - "traefik.http.services.angular-preprod.loadbalancer.server.port=80" 
+     # Ajout du certificat via let's encrypt
+     - "traefik.http.routers.angular-preprod.entrypoints=websecure"
+     - "traefik.http.routers.angular-preprod.tls.certresolver=myresolver"
+    networks:
+     - my-network
+
+  angular-prod:
+    container_name: angular-prod
+    build:
+      context: ${WORKSPACE_PATH}/prod-angular
+      dockerfile: Dockerfile.prod
+    ports:
+      - 84:80  # Mappé sur le port 80 car il y a nginx dans le container
+    labels:
+     - "traefik.enable=true"
+     - "traefik.http.routers.angular-prod.rule=Host(`dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+     - "traefik.http.routers.angular-prod.entrypoints=websecure"
+     - "traefik.http.routers.angular-prod.tls.certresolver=myresolver"
+     - "traefik.http.services.angular-prod.loadbalancer.server.port=80" 
+    networks:
+     - my-network 
+
+  # Service API pour le déploiement
+
+  api-dev:
+    container_name: api-dev # The Tiptop api dev
+    build:
+      context: ${WORKSPACE_PATH}/the-tiptop-api-dev
+      dockerfile: Dockerfile.dev
+    ports:
+      - 4100:${PORT}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api-dev.rule=Host(`api-dev.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+      - "traefik.http.routers.api-dev.middlewares=cors-headers-dev,security@docker" # Ajout d'un middleware pour CORS + entête sécurité
+      - "traefik.http.routers.api-dev.entrypoints=websecure"
+      - "traefik.http.routers.api-dev.tls.certresolver=myresolver"
+      - "traefik.http.services.api-dev.loadbalancer.server.port=4000"
+      # Middleware pour les en-têtes CORS
+      - "traefik.http.middlewares.cors-headers-dev.headers.accesscontrolallowmethods=GET,POST,PATCH,DELETE,PUT,OPTIONS"
+      - "traefik.http.middlewares.cors-headers-dev.headers.accessControlAllowOriginList=https://dev.dsp-archiwebo22b-ji-rw-ah.fr,http://localhost:4200,https://unknown.dsp-archiwebo22b-ji-rw-ah.fr"
+      - "traefik.http.middlewares.cors-headers-dev.headers.accesscontrolallowheaders=Content-Type,Authorization,X-Requested-With"
+      - "traefik.http.middlewares.cors-headers-dev.headers.accessControlAllowCredentials=true"
+      - "traefik.http.middlewares.cors-headers-dev.headers.addvaryheader=true"
+    environment:
+      - HOSTNAME=${HOSTNAME}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+    networks:
+      - my-network
+    depends_on:
+      - db
+    # command: sh -c 'while ! nc -z db 3306; do sleep 1; done; npm run dev'
+
+  api-preprod:
+    container_name: api-preprod # The Tiptop api preprod
+    build:
+      context: ${WORKSPACE_PATH}/the-tiptop-api-preprod
+      dockerfile: Dockerfile.preprod
+    ports:
+      - 4101:${PORT}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api-preprod.rule=Host(`api-preprod.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+      - "traefik.http.routers.api-preprod.middlewares=cors-headers-preprod,security@docker" # Ajout d'un middleware pour CORS + entête sécurité
+      - "traefik.http.routers.api-preprod.entrypoints=websecure"
+      - "traefik.http.routers.api-preprod.tls.certresolver=myresolver"
+      - "traefik.http.services.api-preprod.loadbalancer.server.port=4000"
+      # Middleware pour les en-têtes CORS
+      - "traefik.http.middlewares.cors-headers-preprod.headers.accesscontrolallowmethods=GET,POST,PATCH,DELETE,PUT,OPTIONS"
+      - "traefik.http.middlewares.cors-headers-preprod.headers.accessControlAllowOriginList=https://preprod.dsp-archiwebo22b-ji-rw-ah.fr"
+      - "traefik.http.middlewares.cors-headers-preprod.headers.accesscontrolallowheaders=*"
+      - "traefik.http.middlewares.cors-headers-preprod.headers.addvaryheader=true"
+    environment:
+      - HOSTNAME=${HOSTNAME}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+    networks:
+      - my-network
+    depends_on:
+      - db
+
+  api-prod:
+    container_name: api-prod # The Tiptop api preprod
+    build:
+      context: ${WORKSPACE_PATH}/the-tiptop-api
+      dockerfile: Dockerfile.prod
+    ports:
+      - 4102:${PORT}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api-prod.rule=Host(`api.dsp-archiwebo22b-ji-rw-ah.fr`)" # Vous pouvez ajuster le sous-domaine selon vos besoins.
+      - "traefik.http.routers.api-prod.middlewares=cors-headers-prod,security@docker" # Ajout d'un middleware pour CORS + entête sécurité
+      - "traefik.http.routers.api-prod.entrypoints=websecure"
+      - "traefik.http.routers.api-prod.tls.certresolver=myresolver"
+      - "traefik.http.services.api-prod.loadbalancer.server.port=4000"
+      # Middleware pour les en-têtes CORS
+      - "traefik.http.middlewares.cors-headers-prod.headers.accesscontrolallowmethods=GET,POST,PATCH,DELETE,PUT,OPTIONS"
+      - "traefik.http.middlewares.cors-headers-prod.headers.accessControlAllowOriginList=https://dsp-archiwebo22b-ji-rw-ah.fr,https://preprod.dsp-archiwebo22b-ji-rw-ah.fr,https://dev.dsp-archiwebo22b-ji-rw-ah.fr,http://localhost:4200"
+      - "traefik.http.middlewares.cors-headers-prod.headers.accesscontrolallowheaders=*"
+      - "traefik.http.middlewares.cors-headers-prod.headers.addvaryheader=true"
+    environment:
+      - HOSTNAME=${HOSTNAME}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+    networks:
+      - my-network
+    depends_on:
+      - db
+
+  db:
+    container_name: TheTiptop_Db
+    image: mysql:latest
+    env_file:
+      - .env
+    ports:
+      - 3307:3306
+    networks:
+      - my-network
+    restart: always
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+
+  backup:
+    image: databack/mysql-backup
+    env_file:
+      - .env
+    networks:
+      - my-network
+    environment:
+      - DB_DUMP_CRON=0 21 * * * # Effectue un dump de la DB tous les jours à 21h
+      - DB_SERVER=db # Permet de dire à quel serveur de BDD il doit se connecter
+      - DB_USER=root
+      - DB_PASS=${MYSQL_ROOT_PASSWORD}
+      - DB_NAMES=${MYSQL_DATABASE}
+      - DB_DUMP_TARGET=/db
+    volumes:
+      - ./backups:/db # Stocke les sauvegardes dans le dossier 'backups' de votre hôte
+    depends_on:
+      - db
+
+  # Ajout de phpmyadmin et liaison avec le service DB pour avoir une interface web
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    environment:
+      - PMA_HOST=db
+      - PMA_PORT=3306
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.phpmyadmin.rule=Host(`phpmyadmin.dsp-archiwebo22b-ji-rw-ah.fr`)"
+      - "traefik.http.routers.phpmyadmin.middlewares=security@docker"
+      - "traefik.http.routers.phpmyadmin.entrypoints=websecure"
+      - "traefik.http.routers.phpmyadmin.tls.certresolver=myresolver"
+      - "traefik.http.services.phpmyadmin.loadbalancer.server.port=80"
+    networks:
+      - my-network
+    depends_on:
+      - db
+  
+
+  #Ajout service pour qualité du code
+
+  sonarqube:
+    image: sonarqube:latest
+    networks:
+      - my-network
+    ports:
+      - "9000:9000"
+    environment:
+      - SONARQUBE_JDBC_URL=jdbc:postgresql://db:5432/sonar
+      - SONARQUBE_JDBC_USERNAME=sonar
+      - SONARQUBE_JDBC_PASSWORD=sonar
+    volumes:
+      - /home/debian/sonarqubedata:/opt/sonarqube/data
+      - /home/debian/sonarqubeextensions:/opt/sonarqube/extensions
+      - /home/debian/sonarqubelogs:/opt/sonarqube/logs
+      - /home/debian/sonarqubetemp:/opt/sonarqube/temp
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sonarqube.rule=Host(`sonarqube.dsp-archiwebo22b-ji-rw-ah.fr`)"
+      - "traefik.http.routers.sonarqube.entrypoints=websecure"
+      - "traefik.http.routers.sonarqube.tls.certresolver=myresolver"
+      - "traefik.http.services.sonarqube.loadbalancer.server.port=9000"
+
+  sonar-db:
+    image: postgres:latest
+    networks:
+      - my-network
+    environment:
+      - POSTGRES_USER=sonar
+      - POSTGRES_PASSWORD=sonar
+      - POSTGRES_DB=sonar
+    volumes:
+      - postgresqldata:/var/lib/postgresql/data
+    labels:
+      - "traefik.enable=false" # Nous ne souhaitons pas que la base de données soit accessible depuis Traefik
+
+volumes:
+  postgresqldata:
+  sonarqubedata:
+  sonarqubeextensions:
+  sonarqubelogs:
+  sonarqubetemp:
+  grafanadata:
+  grafanalogs:
+  grafanaplugins:
+  portainer_data:
+  
+
+networks:
+  my-network:
+    external: true
